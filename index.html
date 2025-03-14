@@ -1,0 +1,264 @@
+<!DOCTYPE html>
+<html>
+
+<head>
+    <title>Cloudflare SFU Client</title>
+</head>
+
+<body>
+    <h1>Cloudflare SFU Client</h1>
+    <video id="localVideo" width="320" height="240" autoplay muted></video>
+    <video id="remoteVideo" width="320" height="240" autoplay></video>
+    <button id="createSessionButton">Create Session</button>
+    <button id="createTracksButton">Create Tracks (Audio & Video)</button>
+    <button id="callButton">Call</button>
+    <pre id="log"></pre>
+
+    <script>
+        const logElement = document.getElementById('log');
+        const localVideo = document.getElementById('localVideo');
+        const remoteVideo = document.getElementById('remoteVideo');
+        const createSessionButton = document.getElementById('createSessionButton');
+         const createTracksButton = document.getElementById('createTracksButton');
+        const callButton = document.getElementById('callButton');
+
+        let peerConnection;
+        let localStream;
+        let clientId; // Store the client ID assigned by the server
+        let remoteClientId; // Store the remote client ID
+        let sessionCreated = false;
+        let tracksCreated = false;
+
+        function log(message) {
+            console.log(message);
+            logElement.textContent += message + '\n';
+        }
+
+        const ws = new WebSocket('ws://localhost:3000'); // Replace with your server URL
+
+        ws.addEventListener('open', () => {
+            log('Client: Connected to signaling server');
+        });
+
+        ws.addEventListener('message', async event => {
+            const message = JSON.parse(event.data);
+            log(`Client: Received message from signaling server: ${JSON.stringify(message)}`);
+
+            switch (message.type) {
+                case 'clientId':
+                    clientId = message.clientId;
+                    log(`Client: Assigned client ID: ${clientId}`);
+                    break;
+
+                case 'createSessionResponse':
+                    if (message.success) {
+                         log(`Client: [4] Response from Signaling Server to Client, giving SessionId: ${JSON.stringify(message)}`);
+                         sessionCreated = true
+                    } else {
+                        log(`Client: Failed to create session: ${message.error}`);
+                    }
+                    break;
+                case 'createTracksResponse':
+                    if (message.success) {
+                        log(`Client: Tracks created successfully.`);
+                        tracksCreated = true;
+                        log('Client:  Tracks created.  Now getting user media... ');
+                         startLocalMedia(); // Call function to get user media
+                    } else {
+                        log(`Client: Failed to create tracks: ${message.error}`);
+                    }
+                    break;
+                 case 'sdpOffer': //handle the sdp offer
+                    log('Client: Received SDP offer');
+                     remoteClientId = message.clientId; // Store the remote client ID
+                     try {
+                         await peerConnection.setRemoteDescription({ type: 'offer', sdp: message.sdp });
+                         log('Client: Set remote description from SDP offer');
+
+                         //create sdp Answer
+                         const answer = await peerConnection.createAnswer();
+                         await peerConnection.setLocalDescription(answer);
+                         log('Client: Created SDP answer');
+
+                         //send sdp answer to the signaling server
+                         ws.send(JSON.stringify({
+                             type: 'sdpAnswer',
+                             sdp: answer.sdp,
+                             targetClientId: message.clientId // Send to the originator of the offer
+                         }));
+                         log('Client: Sent SDP answer to signaling server');
+
+                     } catch (error) {
+                         console.error('Error handling SDP offer:', error);
+                     }
+                    break;
+
+                 case 'sdpAnswer'://handle the sdp answer
+                    log('Client: Received SDP answer');
+                     try {
+                         await peerConnection.setRemoteDescription({ type: 'answer', sdp: message.sdp });
+                          log('Client: [9] Set remote description after getting the answer from the signaling server which is of cloudflare');
+                     } catch (error) {
+                         console.error('Error handling SDP answer:', error);
+                     }
+                     break;
+                 case 'iceCandidate':
+                    log('Client: Received ICE candidate');
+                     try {
+                         await peerConnection.addIceCandidate(message.candidate);
+                         log('Client: Added ICE candidate');
+                     } catch (e) {
+                         console.error('Error adding ice candidate', e);
+                     }
+                    break;
+                default:
+                    console.log(`Client: Unknown message type: ${message.type}`);
+            }
+        });
+
+        ws.addEventListener('close', () => {
+            log('Client: Disconnected from signaling server');
+        });
+
+        ws.addEventListener('error', error => {
+            log(`Client: WebSocket error: ${error}`);
+        });
+
+        createSessionButton.addEventListener('click', () => {
+            log('Client: [1] Request sent from client to signaling server for creating a session');
+            const createSessionMessage = { type: 'createSession', thirdparty: false };
+            ws.send(JSON.stringify(createSessionMessage));
+            log(`Client: Sent createSession message to signaling server`);
+        });
+        createTracksButton.addEventListener('click', async () => {
+            log('Client: Sending createTracks request to signaling server');
+
+            // 1. Create a PeerConnection
+            peerConnection = new RTCPeerConnection(); // Create a new RTCPeerConnection
+
+            // 2. Add Transceivers (Audio and Video) - Adjust as needed
+            peerConnection.addTransceiver('audio', { direction: 'sendrecv' }); // Add audio transceiver
+            peerConnection.addTransceiver('video', { direction: 'sendrecv' }); // Add video transceiver
+
+            // 3. Create an SDP Offer
+            try {
+                log('Client: [5] Generating SDP offer by the client');
+                const offer = await peerConnection.createOffer();
+                await peerConnection.setLocalDescription(offer); // Set local description
+                const sdpObject = {
+                    type: offer.type,
+                    sdp: offer.sdp
+                };
+
+                log(`Client: Created SDP offer:`, sdpObject);
+
+                const createTracksMessage = {
+                    type: 'createTracks',
+                    sdp: offer.sdp
+                };
+                log('Client: [6] Request sent from client to signaling server for creating track');
+                ws.send(JSON.stringify(createTracksMessage));
+                log(`Client: Sent createTracks message to signaling server: ${JSON.stringify(createTracksMessage)}`);
+
+            } catch (error) {
+                log(`Client: Error creating SDP offer: ${error}`);
+            }
+        });
+
+        callButton.addEventListener('click', async () => {
+            log('Client: Starting call');
+            startCall();
+        });
+
+        async function startCall() {
+            log('Client: Starting the call process');
+
+            // 1. Get User Media
+            try {
+                localStream = await navigator.mediaDevices.getUserMedia({ audio: true, video: true });
+                log('Client: Local media stream obtained');
+                localVideo.srcObject = localStream;
+
+                // 2. Create Peer Connection
+                peerConnection = new RTCPeerConnection();
+                log('Client: Created RTCPeerConnection');
+
+                // 3. Add Local Media Tracks to Peer Connection
+                localStream.getTracks().forEach(track => {
+                    peerConnection.addTrack(track, localStream);
+                    log(`Client: Added track: ${track.kind}`);
+                });
+
+                // 4. Handle ICE Candidates
+                peerConnection.onicecandidate = event => {
+                    if (event.candidate) {
+                        log('Client: ICE candidate found');
+                        ws.send(JSON.stringify({
+                            type: 'iceCandidate',
+                            candidate: event.candidate,
+                            targetClientId: remoteClientId // Send to the other client
+                        }));
+                        log('Client: Sent ICE candidate to signaling server');
+                    }
+                };
+
+                // 5. Handle Remote Stream
+                peerConnection.ontrack = event => {
+                    log('Client: Received remote track');
+                    remoteVideo.srcObject = event.streams[0];
+                    log('Client: Remote stream displayed');
+                };
+
+                // 6. Create Offer (if this is the caller)
+                 peerConnection.onnegotiationneeded = async () => {
+                    try {
+
+                       log('Client: Creating SDP offer');
+                       const offer = await peerConnection.createOffer();
+                       await peerConnection.setLocalDescription(offer);
+                        const sdpObject = {
+                            type: offer.type,
+                            sdp: offer.sdp
+                        };
+                       log(`Client: Set local description:`,sdpObject);
+
+                       ws.send(JSON.stringify({
+                            type: 'sdpOffer',
+                            sdp: offer.sdp,
+                            targetClientId: remoteClientId // Send to the other client
+                       }));
+                       log('Client: Sent SDP offer to signaling server');
+                   } catch (err) {
+                       console.error(err);
+                   }
+                 };
+
+            } catch (error) {
+                log(`Client: Error starting call: ${error}`);
+            }
+        }
+        async function startLocalMedia() {
+            log('Client: Requesting local media stream...');
+            try {
+                localStream = await navigator.mediaDevices.getUserMedia({ audio: true, video: true });
+                log('Client: Local media stream obtained');
+
+                // Display the local video in the video element
+                localVideo.srcObject = localStream;
+
+                // Add the tracks to the RTCPeerConnection
+                localStream.getTracks().forEach(track => {
+                    peerConnection.addTrack(track, localStream);  // Add track to peer connection
+                    log(`Client: Added track to peer connection: ${track.kind}`);
+                });
+
+                log('Client:  Added local media tracks to peer connection');
+
+            } catch (error) {
+                log(`Client: Error getting user media: ${error}`);
+            }
+        }
+    </script>
+</body>
+
+</html>
